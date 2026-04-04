@@ -11,7 +11,11 @@ The `reva.tools.functions` package provides MCP tools for function analysis, lis
 - `get-function-count` - Get total count of functions (use before listing for pagination)
 - `get-functions` - List functions with pagination and filtering (supports `filterByTag`, `untagged`, `verbose`)
 - `get-functions-by-similarity` - Find functions similar to a target function (compact by default, use `verbose: true` for full details)
+- `get-function-custom-storage` - Return current parameter storage and custom-storage state for a function
 - `set-function-prototype` - Modify function signatures and prototypes with C-style signatures
+- `set-function-custom-storage` - Assign explicit register-backed storage to function parameters
+- `clear-function-custom-storage` - Remove explicit storage and restore dynamic parameter storage
+- `batch-set-function-custom-storage` - Apply explicit register-backed storage to multiple functions in one request
 - `get-undefined-function-candidates` - Find addresses that are referenced but not defined as functions
 - `create-function` - Create a function at an address with auto-detected signature
 - `function-tags` - Manage tags on functions (modes: get/set/add/remove/list)
@@ -231,6 +235,52 @@ for (int i = 0; i < paramDefs.length; i++) {
     }
 }
 ```
+
+### Explicit Register-Backed Parameter Storage
+**Use `set-function-custom-storage` when the ABI is register-based and the decompiler needs explicit storage**:
+```java
+// Parse requested parameter datatypes
+DataType dt = DataTypeParserUtil.parseDataTypeObjectFromString("Car *", "");
+
+// Resolve register storage from the Program
+Register a3 = program.getRegister("A3");
+VariableStorage storage = new VariableStorage(program, a3);
+
+// Create explicit parameter
+ParameterImpl param = new ParameterImpl("car", dt, storage, program);
+
+// Enable custom storage and replace parameters
+function.setCustomVariableStorage(true);
+function.replaceParameters(
+    List.of(param),
+    Function.FunctionUpdateType.CUSTOM_STORAGE,
+    true,
+    SourceType.USER_DEFINED);
+```
+
+This is the correct tool for codebases that pass arguments in registers, such as 68000 binaries
+that use conventions like `A3 == Car * car`.
+
+### Clearing Custom Storage
+**Use `clear-function-custom-storage` to preserve names/types but let Ghidra recompute storage**:
+```java
+List<Variable> params = new ArrayList<>();
+for (Parameter parameter : function.getParameters()) {
+    params.add(new ParameterImpl(parameter.getName(), parameter.getDataType(), program));
+}
+
+function.setCustomVariableStorage(false);
+function.replaceParameters(
+    params,
+    Function.FunctionUpdateType.DYNAMIC_STORAGE_ALL_PARAMS,
+    true,
+    SourceType.USER_DEFINED);
+```
+
+### Batch Updates
+**Use `batch-set-function-custom-storage` for whole ABI families**:
+- Best for codebases with repeated conventions like `A3 == Car * car`
+- Prefer a single batch tool call over many individual tool calls when normalizing a subsystem
 
 **Important**: `needsCustomStorageForSignature` checks if:
 - Any auto-parameter's data type is being changed

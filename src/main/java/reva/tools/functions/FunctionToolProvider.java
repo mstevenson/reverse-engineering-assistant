@@ -20,6 +20,7 @@ import java.util.Collections;
 import java.util.Comparator;
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -35,6 +36,7 @@ import ghidra.app.util.parser.FunctionSignatureParser;
 import ghidra.program.model.address.Address;
 import ghidra.program.model.address.AddressSet;
 import ghidra.program.model.address.AddressSetView;
+import ghidra.program.model.data.DataType;
 import ghidra.program.model.data.FunctionDefinitionDataType;
 import ghidra.program.model.data.ParameterDefinition;
 import ghidra.program.model.data.ParameterDefinitionImpl;
@@ -48,6 +50,8 @@ import ghidra.program.model.listing.Parameter;
 import ghidra.program.model.listing.ParameterImpl;
 import ghidra.program.model.listing.Program;
 import ghidra.program.model.listing.Variable;
+import ghidra.program.model.lang.Register;
+import ghidra.program.model.listing.VariableStorage;
 import ghidra.program.model.mem.MemoryBlock;
 import ghidra.program.model.symbol.Reference;
 import ghidra.program.model.symbol.ReferenceIterator;
@@ -61,6 +65,7 @@ import io.modelcontextprotocol.server.McpSyncServer;
 import io.modelcontextprotocol.spec.McpSchema;
 import reva.tools.AbstractToolProvider;
 import reva.util.AddressUtil;
+import reva.util.DataTypeParserUtil;
 import reva.util.SimilarityComparator;
 import reva.util.SymbolUtil;
 
@@ -325,7 +330,11 @@ public class FunctionToolProvider extends AbstractToolProvider {
         registerFunctionCountTool();
         registerFunctionsTool();
         registerFunctionsBySimilarityTool();
+        registerGetFunctionCustomStorageTool();
         registerSetFunctionPrototypeTool();
+        registerSetFunctionCustomStorageTool();
+        registerClearFunctionCustomStorageTool();
+        registerBatchSetFunctionCustomStorageTool();
         registerUndefinedFunctionCandidatesTool();
         registerCreateFunctionTool();
         registerFunctionTagsTool();
@@ -816,6 +825,7 @@ public class FunctionToolProvider extends AbstractToolProvider {
         functionInfo.put("returnType", function.getReturnType().toString());
         functionInfo.put("isExternal", function.isExternal());
         functionInfo.put("isThunk", function.isThunk());
+        functionInfo.put("customStorageEnabled", function.hasCustomVariableStorage());
 
         // Analysis progress indicators (helps prioritize which functions to investigate)
         functionInfo.put("isDefaultName", SymbolUtil.isDefaultSymbolName(function.getName()));
@@ -836,11 +846,13 @@ public class FunctionToolProvider extends AbstractToolProvider {
         // Add parameters info (as immutable list of immutable maps)
         List<Map<String, String>> parameters = new ArrayList<>();
         for (int i = 0; i < function.getParameterCount(); i++) {
+            Parameter parameter = function.getParameter(i);
             // Use Map.of for immutable parameter info
-            parameters.add(Map.of(
-                "name", function.getParameter(i).getName(),
-                "dataType", function.getParameter(i).getDataType().toString()
-            ));
+            Map<String, String> parameterInfo = new LinkedHashMap<>();
+            parameterInfo.put("name", parameter.getName());
+            parameterInfo.put("dataType", parameter.getDataType().toString());
+            parameterInfo.put("storage", parameter.getVariableStorage().toString());
+            parameters.add(Collections.unmodifiableMap(parameterInfo));
         }
         functionInfo.put("parameters", List.copyOf(parameters));
 
@@ -1133,6 +1145,432 @@ public class FunctionToolProvider extends AbstractToolProvider {
                 return createErrorResult(e.getMessage());
             } catch (Exception e) {
                 return createErrorResult("Unexpected error: " + e.getMessage());
+            }
+        });
+    }
+
+    /**
+     * Parse and validate parameter specifications for custom storage assignment.
+     */
+    @SuppressWarnings("unchecked")
+    private List<Variable> buildCustomStorageParameters(Program program, List<Object> rawParameters)
+            throws Exception {
+        List<Variable> parameters = new ArrayList<>();
+
+        for (int i = 0; i < rawParameters.size(); i++) {
+            Object rawParam = rawParameters.get(i);
+            if (!(rawParam instanceof Map<?, ?> rawMap)) {
+                throw new IllegalArgumentException("Parameter entry at index " + i + " must be an object");
+            }
+
+            Map<String, Object> paramMap = (Map<String, Object>) rawMap;
+            String name = getString(paramMap, "name");
+            String dataTypeString = getString(paramMap, "dataType");
+            DataType dataType = DataTypeParserUtil.parseDataTypeObjectFromString(dataTypeString, "");
+            if (dataType == null) {
+                throw new IllegalArgumentException("Unable to resolve data type: " + dataTypeString);
+            }
+
+            VariableStorage storage;
+            Object singleRegister = paramMap.get("register");
+            Object multiRegisters = paramMap.get("registers");
+            if (singleRegister != null) {
+                Register register = program.getRegister(singleRegister.toString());
+                if (register == null) {
+                    throw new IllegalArgumentException("Unknown register '" + singleRegister + "' for parameter '" + name + "'");
+                }
+                storage = new VariableStorage(program, register);
+            } else if (multiRegisters instanceof List<?> registerList && !registerList.isEmpty()) {
+                Register[] registers = new Register[registerList.size()];
+                for (int regIndex = 0; regIndex < registerList.size(); regIndex++) {
+                    Object registerName = registerList.get(regIndex);
+                    Register register = program.getRegister(registerName.toString());
+                    if (register == null) {
+                        throw new IllegalArgumentException("Unknown register '" + registerName + "' for parameter '" + name + "'");
+                    }
+                    registers[regIndex] = register;
+                }
+                storage = new VariableStorage(program, registers);
+            } else {
+                throw new IllegalArgumentException(
+                    "Parameter '" + name + "' must include either 'register' or non-empty 'registers'");
+            }
+
+            if (dataType.getLength() > 0 && storage.size() != dataType.getLength()) {
+                throw new IllegalArgumentException(
+                    "Storage size mismatch for parameter '" + name + "': datatype " +
+                    dataType.getDisplayName() + " is " + dataType.getLength() +
+                    " bytes but storage " + storage + " is " + storage.size() + " bytes");
+            }
+
+            parameters.add(new ParameterImpl(name, dataType, storage, program));
+        }
+
+        return parameters;
+    }
+
+    /**
+     * Create auto-stored parameter list from an existing function, preserving names and datatypes
+     * while letting Ghidra recompute storage.
+     */
+    private List<Variable> buildDynamicParametersFromFunction(Function function, Program program)
+            throws InvalidInputException {
+        List<Variable> parameters = new ArrayList<>();
+        for (Parameter parameter : function.getParameters()) {
+            parameters.add(new ParameterImpl(
+                parameter.getName(),
+                parameter.getDataType(),
+                program));
+        }
+        return parameters;
+    }
+
+    /**
+     * Resolve function from location with consistent error handling.
+     */
+    private Function getFunctionAtLocation(Program program, String location) {
+        Address address = AddressUtil.resolveAddressOrSymbol(program, location);
+        if (address == null) {
+            throw new IllegalArgumentException("Invalid address or symbol: " + location);
+        }
+
+        Function function = program.getFunctionManager().getFunctionAt(address);
+        if (function == null) {
+            throw new IllegalArgumentException("Function does not exist at " + AddressUtil.formatAddress(address));
+        }
+
+        return function;
+    }
+
+    /**
+     * Register a tool to get explicit custom storage information for a function.
+     */
+    private void registerGetFunctionCustomStorageTool() {
+        Map<String, Object> properties = new HashMap<>();
+        properties.put("programPath", Map.of(
+            "type", "string",
+            "description", "Path in the Ghidra Project to the program"
+        ));
+        properties.put("location", Map.of(
+            "type", "string",
+            "description", "Address or symbol name where the function is located"
+        ));
+
+        List<String> required = List.of("programPath", "location");
+
+        McpSchema.Tool tool = McpSchema.Tool.builder()
+            .name("get-function-custom-storage")
+            .title("Get Function Custom Storage")
+            .description("Return the current custom parameter storage model for a function.")
+            .inputSchema(createSchema(properties, required))
+            .build();
+
+        registerTool(tool, (exchange, request) -> {
+            try {
+                Program program = getProgramFromArgs(request);
+                String location = getString(request, "location");
+                Function function = getFunctionAtLocation(program, location);
+
+                Map<String, Object> result = new HashMap<>();
+                result.put("success", true);
+                result.put("programPath", getString(request, "programPath"));
+                result.put("address", AddressUtil.formatAddress(function.getEntryPoint()));
+                result.put("function", createFunctionInfo(function, null));
+                return createJsonResult(result);
+            } catch (Exception e) {
+                return createErrorResult("Error getting function custom storage: " + e.getMessage());
+            }
+        });
+    }
+
+    /**
+     * Register a tool to set explicit custom register-backed parameter storage on a function.
+     */
+    private void registerSetFunctionCustomStorageTool() {
+        Map<String, Object> parameterSpecProperties = new HashMap<>();
+        parameterSpecProperties.put("name", Map.of(
+            "type", "string",
+            "description", "Parameter name"
+        ));
+        parameterSpecProperties.put("dataType", Map.of(
+            "type", "string",
+            "description", "Data type string (e.g., 'Car *', 'int', 'char**')"
+        ));
+        parameterSpecProperties.put("register", Map.of(
+            "type", "string",
+            "description", "Single register backing the parameter (e.g., 'A3')"
+        ));
+        parameterSpecProperties.put("registers", Map.of(
+            "type", "array",
+            "description", "Optional register list for multi-register storage",
+            "items", Map.of("type", "string")
+        ));
+
+        Map<String, Object> properties = new HashMap<>();
+        properties.put("programPath", Map.of(
+            "type", "string",
+            "description", "Path in the Ghidra Project to the program"
+        ));
+        properties.put("location", Map.of(
+            "type", "string",
+            "description", "Address or symbol name where the function is located"
+        ));
+        properties.put("parameters", Map.of(
+            "type", "array",
+            "description", "Explicit custom-storage parameter specifications",
+            "items", createSchema(parameterSpecProperties, List.of("name", "dataType"))
+        ));
+        properties.put("replaceExisting", Map.of(
+            "type", "boolean",
+            "description", "Replace existing parameters instead of merging with them",
+            "default", true
+        ));
+
+        List<String> required = List.of("programPath", "location", "parameters");
+
+        McpSchema.Tool tool = McpSchema.Tool.builder()
+            .name("set-function-custom-storage")
+            .title("Set Function Custom Storage")
+            .description("Assign explicit register-backed storage to a function's parameters.")
+            .inputSchema(createSchema(properties, required))
+            .build();
+
+        registerTool(tool, (exchange, request) -> {
+            try {
+                Program program = getProgramFromArgs(request);
+                String programPath = getString(request, "programPath");
+                Address address = getAddressFromArgs(request, program, "location");
+                boolean replaceExisting = getOptionalBoolean(request, "replaceExisting", true);
+
+                Object rawParameters = request.arguments().get("parameters");
+                if (!(rawParameters instanceof List<?> parameterList)) {
+                    return createErrorResult("Parameter 'parameters' must be an array");
+                }
+
+                Function function = program.getFunctionManager().getFunctionAt(address);
+                if (function == null) {
+                    return createErrorResult("Function does not exist at " + AddressUtil.formatAddress(address));
+                }
+
+                int txId = program.startTransaction("Set Function Custom Storage");
+                boolean committed = false;
+                try {
+                    List<Variable> parameters = buildCustomStorageParameters(program, new ArrayList<>(parameterList));
+                    function.setCustomVariableStorage(true);
+                    Function.FunctionUpdateType updateType = Function.FunctionUpdateType.CUSTOM_STORAGE;
+                    function.replaceParameters(parameters, updateType, replaceExisting, SourceType.USER_DEFINED);
+                    program.endTransaction(txId, true);
+                    committed = true;
+                } catch (Exception e) {
+                    if (!committed) {
+                        program.endTransaction(txId, false);
+                    }
+                    return createErrorResult("Error setting function custom storage: " + e.getMessage());
+                }
+
+                invalidateFunctionCaches(programPath);
+
+                Map<String, Object> result = new HashMap<>();
+                result.put("success", true);
+                result.put("programPath", programPath);
+                result.put("address", AddressUtil.formatAddress(address));
+                result.put("customStorageEnabled", function.hasCustomVariableStorage());
+                result.put("function", createFunctionInfo(function, null));
+                return createJsonResult(result);
+            } catch (Exception e) {
+                return createErrorResult("Error setting function custom storage: " + e.getMessage());
+            }
+        });
+    }
+
+    /**
+     * Register a tool to clear explicit custom parameter storage and restore dynamic storage.
+     */
+    private void registerClearFunctionCustomStorageTool() {
+        Map<String, Object> properties = new HashMap<>();
+        properties.put("programPath", Map.of(
+            "type", "string",
+            "description", "Path in the Ghidra Project to the program"
+        ));
+        properties.put("location", Map.of(
+            "type", "string",
+            "description", "Address or symbol name where the function is located"
+        ));
+
+        List<String> required = List.of("programPath", "location");
+
+        McpSchema.Tool tool = McpSchema.Tool.builder()
+            .name("clear-function-custom-storage")
+            .title("Clear Function Custom Storage")
+            .description("Disable custom parameter storage and restore dynamic storage for a function.")
+            .inputSchema(createSchema(properties, required))
+            .build();
+
+        registerTool(tool, (exchange, request) -> {
+            try {
+                Program program = getProgramFromArgs(request);
+                String programPath = getString(request, "programPath");
+                String location = getString(request, "location");
+                Function function = getFunctionAtLocation(program, location);
+
+                int txId = program.startTransaction("Clear Function Custom Storage");
+                boolean committed = false;
+                try {
+                    List<Variable> parameters = buildDynamicParametersFromFunction(function, program);
+                    function.setCustomVariableStorage(false);
+                    function.replaceParameters(
+                        parameters,
+                        Function.FunctionUpdateType.DYNAMIC_STORAGE_ALL_PARAMS,
+                        true,
+                        SourceType.USER_DEFINED);
+                    program.endTransaction(txId, true);
+                    committed = true;
+                } catch (Exception e) {
+                    if (!committed) {
+                        program.endTransaction(txId, false);
+                    }
+                    return createErrorResult("Error clearing function custom storage: " + e.getMessage());
+                }
+
+                invalidateFunctionCaches(programPath);
+
+                Map<String, Object> result = new HashMap<>();
+                result.put("success", true);
+                result.put("programPath", programPath);
+                result.put("address", AddressUtil.formatAddress(function.getEntryPoint()));
+                result.put("customStorageEnabled", function.hasCustomVariableStorage());
+                result.put("function", createFunctionInfo(function, null));
+                return createJsonResult(result);
+            } catch (Exception e) {
+                return createErrorResult("Error clearing function custom storage: " + e.getMessage());
+            }
+        });
+    }
+
+    /**
+     * Register a tool to batch-apply explicit custom register-backed parameter storage.
+     */
+    private void registerBatchSetFunctionCustomStorageTool() {
+        Map<String, Object> parameterSpecProperties = new HashMap<>();
+        parameterSpecProperties.put("name", Map.of(
+            "type", "string",
+            "description", "Parameter name"
+        ));
+        parameterSpecProperties.put("dataType", Map.of(
+            "type", "string",
+            "description", "Data type string (e.g., 'Car *', 'int', 'char**')"
+        ));
+        parameterSpecProperties.put("register", Map.of(
+            "type", "string",
+            "description", "Single register backing the parameter"
+        ));
+        parameterSpecProperties.put("registers", Map.of(
+            "type", "array",
+            "description", "Optional register list for multi-register storage",
+            "items", Map.of("type", "string")
+        ));
+
+        Map<String, Object> functionSpecProperties = new HashMap<>();
+        functionSpecProperties.put("location", Map.of(
+            "type", "string",
+            "description", "Address or symbol name where the function is located"
+        ));
+        functionSpecProperties.put("parameters", Map.of(
+            "type", "array",
+            "description", "Explicit custom-storage parameter specifications",
+            "items", createSchema(parameterSpecProperties, List.of("name", "dataType"))
+        ));
+        functionSpecProperties.put("replaceExisting", Map.of(
+            "type", "boolean",
+            "description", "Replace existing parameters instead of merging with them",
+            "default", true
+        ));
+
+        Map<String, Object> properties = new HashMap<>();
+        properties.put("programPath", Map.of(
+            "type", "string",
+            "description", "Path in the Ghidra Project to the program"
+        ));
+        properties.put("functions", Map.of(
+            "type", "array",
+            "description", "List of functions to update",
+            "items", createSchema(functionSpecProperties, List.of("location", "parameters"))
+        ));
+
+        List<String> required = List.of("programPath", "functions");
+
+        McpSchema.Tool tool = McpSchema.Tool.builder()
+            .name("batch-set-function-custom-storage")
+            .title("Batch Set Function Custom Storage")
+            .description("Assign explicit register-backed storage to multiple functions in one request.")
+            .inputSchema(createSchema(properties, required))
+            .build();
+
+        registerTool(tool, (exchange, request) -> {
+            try {
+                Program program = getProgramFromArgs(request);
+                String programPath = getString(request, "programPath");
+
+                Object rawFunctions = request.arguments().get("functions");
+                if (!(rawFunctions instanceof List<?> functionList)) {
+                    return createErrorResult("Parameter 'functions' must be an array");
+                }
+
+                List<Map<String, Object>> results = new ArrayList<>();
+                int txId = program.startTransaction("Batch Set Function Custom Storage");
+                boolean committed = false;
+                try {
+                    for (int i = 0; i < functionList.size(); i++) {
+                        Object rawEntry = functionList.get(i);
+                        if (!(rawEntry instanceof Map<?, ?> rawMap)) {
+                            throw new IllegalArgumentException("Function entry at index " + i + " must be an object");
+                        }
+
+                        @SuppressWarnings("unchecked")
+                        Map<String, Object> functionEntry = (Map<String, Object>) rawMap;
+                        String location = getString(functionEntry, "location");
+                        Function function = getFunctionAtLocation(program, location);
+                        boolean replaceExisting = getOptionalBoolean(functionEntry, "replaceExisting", true);
+
+                        Object rawParameters = functionEntry.get("parameters");
+                        if (!(rawParameters instanceof List<?> parameterList)) {
+                            throw new IllegalArgumentException(
+                                "Function entry at index " + i + " must include array 'parameters'");
+                        }
+
+                        List<Variable> parameters = buildCustomStorageParameters(program, new ArrayList<>(parameterList));
+                        function.setCustomVariableStorage(true);
+                        function.replaceParameters(
+                            parameters,
+                            Function.FunctionUpdateType.CUSTOM_STORAGE,
+                            replaceExisting,
+                            SourceType.USER_DEFINED);
+
+                        Map<String, Object> functionResult = new HashMap<>();
+                        functionResult.put("address", AddressUtil.formatAddress(function.getEntryPoint()));
+                        functionResult.put("function", createFunctionInfo(function, null));
+                        results.add(functionResult);
+                    }
+
+                    program.endTransaction(txId, true);
+                    committed = true;
+                } catch (Exception e) {
+                    if (!committed) {
+                        program.endTransaction(txId, false);
+                    }
+                    return createErrorResult("Error batch setting function custom storage: " + e.getMessage());
+                }
+
+                invalidateFunctionCaches(programPath);
+
+                Map<String, Object> result = new HashMap<>();
+                result.put("success", true);
+                result.put("programPath", programPath);
+                result.put("updatedCount", results.size());
+                result.put("functions", results);
+                return createJsonResult(result);
+            } catch (Exception e) {
+                return createErrorResult("Error batch setting function custom storage: " + e.getMessage());
             }
         });
     }

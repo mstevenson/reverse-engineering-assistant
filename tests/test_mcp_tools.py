@@ -114,6 +114,61 @@ class TestFunctionTools:
         # Should get a response (even if error)
         assert response is not None
 
+    def test_set_function_custom_storage_callable(self, mcp_client):
+        """set-function-custom-storage tool is registered and callable"""
+        response = mcp_client.call_tool("set-function-custom-storage", {
+            "programPath": "/TestProgram",
+            "location": "0x00401000",
+            "parameters": [
+                {
+                    "name": "car",
+                    "dataType": "void *",
+                    "register": "A3"
+                }
+            ]
+        })
+
+        # Should get a response (even if error)
+        assert response is not None
+
+    def test_get_function_custom_storage_callable(self, mcp_client):
+        """get-function-custom-storage tool is registered and callable"""
+        response = mcp_client.call_tool("get-function-custom-storage", {
+            "programPath": "/TestProgram",
+            "location": "0x00401000"
+        })
+
+        assert response is not None
+
+    def test_clear_function_custom_storage_callable(self, mcp_client):
+        """clear-function-custom-storage tool is registered and callable"""
+        response = mcp_client.call_tool("clear-function-custom-storage", {
+            "programPath": "/TestProgram",
+            "location": "0x00401000"
+        })
+
+        assert response is not None
+
+    def test_batch_set_function_custom_storage_callable(self, mcp_client):
+        """batch-set-function-custom-storage tool is registered and callable"""
+        response = mcp_client.call_tool("batch-set-function-custom-storage", {
+            "programPath": "/TestProgram",
+            "functions": [
+                {
+                    "location": "0x00401000",
+                    "parameters": [
+                        {
+                            "name": "car",
+                            "dataType": "void *",
+                            "register": "A3"
+                        }
+                    ]
+                }
+            ]
+        })
+
+        assert response is not None
+
 
 class TestToolRegistration:
     """Test that key tools are registered"""
@@ -123,6 +178,10 @@ class TestToolRegistration:
         "get-functions",
         "get-strings",
         "get-decompilation",
+        "get-function-custom-storage",
+        "set-function-custom-storage",
+        "clear-function-custom-storage",
+        "batch-set-function-custom-storage",
         "analyze-program",
         "find-cross-references"
     ])
