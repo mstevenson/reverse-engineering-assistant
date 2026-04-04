@@ -56,6 +56,8 @@ public class StructureToolProvider extends AbstractToolProvider {
         registerGetStructureInfoTool();
         registerListStructuresTool();
         registerApplyStructureTool();
+        registerRenameStructureComponentTool();
+        registerSetStructureComponentTypeTool();
         registerDeleteStructureTool();
         registerParseCHeaderTool();
     }
@@ -468,6 +470,347 @@ public class StructureToolProvider extends AbstractToolProvider {
                     program.endTransaction(txId, false);
                     Msg.error(this, "Failed to apply structure", e);
                     return createErrorResult("Failed to apply structure: " + e.getMessage());
+                }
+            } catch (Exception e) {
+                return createErrorResult("Error: " + e.getMessage());
+            }
+        });
+    }
+
+
+    /**
+     * Register tool to rename or update a single structure/union component in place.
+     */
+    private void registerRenameStructureComponentTool() {
+        Map<String, Object> properties = new HashMap<>();
+        properties.put("programPath", SchemaUtil.createStringProperty("Path of the program"));
+        properties.put("structureName", SchemaUtil.createStringProperty("Name of the structure or union"));
+        properties.put("fieldName", SchemaUtil.createOptionalStringProperty("Existing field name to match"));
+        properties.put("ordinal", Map.of(
+            "type", "integer",
+            "description", "Component ordinal to rename (0-based)"
+        ));
+        properties.put("offset", SchemaUtil.createOptionalStringProperty(
+            "Component offset to rename (decimal or hex like 0x2e)"));
+        properties.put("newFieldName", SchemaUtil.createStringProperty("New field name"));
+        properties.put("newComment", SchemaUtil.createOptionalStringProperty("Optional new comment for the component"));
+
+        List<String> required = new ArrayList<>();
+        required.add("programPath");
+        required.add("structureName");
+        required.add("newFieldName");
+
+        McpSchema.Tool tool = McpSchema.Tool.builder()
+            .name("rename-structure-component")
+            .title("Rename Structure Component")
+            .description("Rename a single structure or union component in place without rebuilding the full datatype. " +
+                         "Select the component by fieldName, ordinal, or offset. Optionally update its comment.")
+            .inputSchema(createSchema(properties, required))
+            .build();
+
+        registerTool(tool, (exchange, request) -> {
+            try {
+                Program program = getProgramFromArgs(request);
+                String structureName = getString(request, "structureName");
+                String fieldName = getOptionalString(request, "fieldName", null);
+                Integer ordinal = getOptionalInteger(request.arguments(), "ordinal", null);
+                String offsetString = getOptionalString(request, "offset", null);
+                String newFieldName = getString(request, "newFieldName");
+                String newComment = getOptionalString(request, "newComment", null);
+
+                int selectors = 0;
+                if (fieldName != null && !fieldName.isBlank()) selectors++;
+                if (ordinal != null) selectors++;
+                if (offsetString != null && !offsetString.isBlank()) selectors++;
+                if (selectors != 1) {
+                    return createErrorResult("Specify exactly one selector: fieldName, ordinal, or offset");
+                }
+
+                DataTypeManager dtm = program.getDataTypeManager();
+                DataType dt = findDataTypeByName(dtm, structureName);
+                if (dt == null) {
+                    return createErrorResult("Structure not found: " + structureName);
+                }
+                if (!(dt instanceof Composite composite)) {
+                    return createErrorResult("Data type is not a structure or union: " + structureName);
+                }
+
+                DataTypeComponent component = null;
+                if (fieldName != null && !fieldName.isBlank()) {
+                    for (DataTypeComponent comp : composite.getDefinedComponents()) {
+                        if (fieldName.equals(comp.getFieldName())) {
+                            component = comp;
+                            break;
+                        }
+                    }
+                    if (component == null) {
+                        return createErrorResult("Component not found by fieldName: " + fieldName);
+                    }
+                }
+                else if (ordinal != null) {
+                    if (ordinal < 0 || ordinal >= composite.getNumComponents()) {
+                        return createErrorResult("Ordinal out of range: " + ordinal);
+                    }
+                    component = composite.getComponent(ordinal);
+                    if (component == null) {
+                        return createErrorResult("Component not found at ordinal: " + ordinal);
+                    }
+                }
+                else {
+                    int offset;
+                    try {
+                        offset = Integer.decode(offsetString);
+                    } catch (NumberFormatException e) {
+                        return createErrorResult("Invalid offset: " + offsetString);
+                    }
+                    if (composite instanceof Structure struct) {
+                        component = struct.getComponentAt(offset);
+                    }
+                    else if (composite instanceof Union) {
+                        for (DataTypeComponent comp : composite.getDefinedComponents()) {
+                            if (comp.getOffset() == offset) {
+                                component = comp;
+                                break;
+                            }
+                        }
+                    }
+                    if (component == null) {
+                        return createErrorResult("Component not found at offset: " + offsetString);
+                    }
+                }
+
+                String oldFieldName = component.getFieldName();
+                String oldComment = component.getComment();
+
+                int txId = program.startTransaction("Rename Structure Component");
+                try {
+                    component.setFieldName(newFieldName);
+                    if (request.arguments().containsKey("newComment")) {
+                        component.setComment(newComment);
+                    }
+
+                    program.endTransaction(txId, true);
+
+                    Map<String, Object> result = new HashMap<>();
+                    result.put("message", "Successfully updated component in structure: " + structureName);
+                    result.put("structureName", composite.getName());
+                    result.put("isUnion", composite instanceof Union);
+
+                    Map<String, Object> componentInfo = new HashMap<>();
+                    componentInfo.put("ordinal", component.getOrdinal());
+                    componentInfo.put("offset", component.getOffset());
+                    componentInfo.put("length", component.getLength());
+                    componentInfo.put("oldFieldName", oldFieldName);
+                    componentInfo.put("newFieldName", component.getFieldName());
+                    componentInfo.put("dataType", component.getDataType().getDisplayName());
+                    componentInfo.put("oldComment", oldComment);
+                    componentInfo.put("newComment", component.getComment());
+                    result.put("component", componentInfo);
+                    result.put("structure", createDetailedStructureInfo(composite));
+                    return createJsonResult(result);
+                } catch (Exception e) {
+                    program.endTransaction(txId, false);
+                    Msg.error(this, "Failed to rename structure component", e);
+                    return createErrorResult("Failed to rename structure component: " + e.getMessage());
+                }
+            } catch (Exception e) {
+                return createErrorResult("Error: " + e.getMessage());
+            }
+        });
+    }
+
+
+    /**
+     * Register tool to update a single structure component's datatype in place.
+     */
+    private void registerSetStructureComponentTypeTool() {
+        Map<String, Object> properties = new HashMap<>();
+        properties.put("programPath", SchemaUtil.createStringProperty("Path of the program"));
+        properties.put("structureName", SchemaUtil.createStringProperty("Name of the structure"));
+        properties.put("fieldName", SchemaUtil.createOptionalStringProperty("Existing field name to match"));
+        properties.put("ordinal", Map.of(
+            "type", "integer",
+            "description", "Component ordinal to update (0-based)"
+        ));
+        properties.put("offset", SchemaUtil.createOptionalStringProperty(
+            "Component offset to update (decimal or hex like 0x2e)"));
+        properties.put("dataType", SchemaUtil.createStringProperty(
+            "New datatype string (e.g. short, pointer, Car *, int[4])"));
+        properties.put("archiveName", SchemaUtil.createOptionalStringProperty(
+            "Optional data type archive to search first"));
+        properties.put("newFieldName", SchemaUtil.createOptionalStringProperty(
+            "Optional replacement field name; defaults to existing field name"));
+        properties.put("newComment", SchemaUtil.createOptionalStringProperty(
+            "Optional replacement comment; defaults to existing comment"));
+
+        List<String> required = new ArrayList<>();
+        required.add("programPath");
+        required.add("structureName");
+        required.add("dataType");
+
+        McpSchema.Tool tool = McpSchema.Tool.builder()
+            .name("set-structure-component-type")
+            .title("Set Structure Component Type")
+            .description("Update a single structure component's datatype in place without rebuilding the full datatype. " +
+                         "Select the component by fieldName, ordinal, or offset. Preserves layout-sensitive structures.")
+            .inputSchema(createSchema(properties, required))
+            .build();
+
+        registerTool(tool, (exchange, request) -> {
+            try {
+                Program program = getProgramFromArgs(request);
+                String structureName = getString(request, "structureName");
+                String fieldName = getOptionalString(request, "fieldName", null);
+                Integer ordinal = getOptionalInteger(request.arguments(), "ordinal", null);
+                String offsetString = getOptionalString(request, "offset", null);
+                String dataTypeString = getString(request, "dataType");
+                String archiveName = getOptionalString(request, "archiveName", null);
+                String requestedFieldName = getOptionalString(request, "newFieldName", null);
+                String requestedComment = request.arguments().containsKey("newComment")
+                    ? getOptionalString(request, "newComment", null) : null;
+
+                int selectors = 0;
+                if (fieldName != null && !fieldName.isBlank()) selectors++;
+                if (ordinal != null) selectors++;
+                if (offsetString != null && !offsetString.isBlank()) selectors++;
+                if (selectors != 1) {
+                    return createErrorResult("Specify exactly one selector: fieldName, ordinal, or offset");
+                }
+
+                DataTypeManager dtm = program.getDataTypeManager();
+                DataType dt = findDataTypeByName(dtm, structureName);
+                if (!(dt instanceof Structure struct)) {
+                    return createErrorResult("Data type is not a structure: " + structureName);
+                }
+
+                DataTypeComponent component = null;
+                if (fieldName != null && !fieldName.isBlank()) {
+                    for (DataTypeComponent comp : struct.getDefinedComponents()) {
+                        if (fieldName.equals(comp.getFieldName())) {
+                            component = comp;
+                            break;
+                        }
+                    }
+                    if (component == null) {
+                        return createErrorResult("Component not found by fieldName: " + fieldName);
+                    }
+                }
+                else if (ordinal != null) {
+                    if (ordinal < 0 || ordinal >= struct.getNumComponents()) {
+                        return createErrorResult("Ordinal out of range: " + ordinal);
+                    }
+                    component = struct.getComponent(ordinal);
+                    if (component == null) {
+                        return createErrorResult("Component not found at ordinal: " + ordinal);
+                    }
+                }
+                else {
+                    int offset;
+                    try {
+                        offset = Integer.decode(offsetString);
+                    } catch (NumberFormatException e) {
+                        return createErrorResult("Invalid offset: " + offsetString);
+                    }
+                    component = struct.getComponentAt(offset);
+                    if (component == null) {
+                        return createErrorResult("Component not found at offset: " + offsetString);
+                    }
+                }
+
+                DataType newDataType;
+                try {
+                    newDataType = DataTypeParserUtil.parseDataTypeObjectFromString(dataTypeString, archiveName);
+                } catch (Exception e) {
+                    return createErrorResult("Failed to resolve datatype: " + e.getMessage());
+                }
+                if (newDataType == null) {
+                    return createErrorResult("Failed to resolve datatype: " + dataTypeString);
+                }
+
+                newDataType = dtm.resolve(newDataType, DataTypeConflictHandler.DEFAULT_HANDLER);
+
+                String oldFieldName = component.getFieldName();
+                String oldComment = component.getComment();
+                DataType oldDataType = component.getDataType();
+                int componentOffset = component.getOffset();
+                int oldLength = component.getLength();
+                int originalStructLength = struct.getLength();
+                int newLength = newDataType.getLength();
+                if (newLength <= 0) {
+                    return createErrorResult("New datatype must have a fixed positive size: " + dataTypeString);
+                }
+                if (newLength != oldLength) {
+                    return createErrorResult("Datatype size mismatch for in-place replacement at offset 0x" +
+                        Integer.toHexString(componentOffset) + ": old component length is " + oldLength +
+                        " bytes but new datatype is " + newLength +
+                        " bytes. This tool only supports fixed-size in-place replacement.");
+                }
+
+                String finalFieldName = requestedFieldName != null ? requestedFieldName : oldFieldName;
+                String finalComment = request.arguments().containsKey("newComment") ? requestedComment : oldComment;
+
+                List<Map<String, Object>> componentSpecs = new ArrayList<>();
+                for (DataTypeComponent comp : struct.getDefinedComponents()) {
+                    Map<String, Object> spec = new HashMap<>();
+                    spec.put("offset", comp.getOffset());
+                    spec.put("length", comp.getLength());
+                    spec.put("fieldName", comp.getFieldName());
+                    spec.put("comment", comp.getComment());
+                    spec.put("dataType", comp.getDataType());
+                    componentSpecs.add(spec);
+                }
+                for (Map<String, Object> spec : componentSpecs) {
+                    if (((Integer) spec.get("offset")) == componentOffset) {
+                        spec.put("dataType", newDataType);
+                        spec.put("fieldName", finalFieldName);
+                        spec.put("comment", finalComment);
+                        spec.put("length", newLength);
+                        break;
+                    }
+                }
+
+                int txId = program.startTransaction("Set Structure Component Type");
+                try {
+                    struct.setPackingEnabled(false);
+                    struct.deleteAll();
+                    for (Map<String, Object> spec : componentSpecs) {
+                        struct.insertAtOffset(
+                            (Integer) spec.get("offset"),
+                            (DataType) spec.get("dataType"),
+                            (Integer) spec.get("length"),
+                            (String) spec.get("fieldName"),
+                            (String) spec.get("comment")
+                        );
+                    }
+                    if (struct.getLength() < originalStructLength) {
+                        struct.growStructure(originalStructLength - struct.getLength());
+                    }
+                    DataTypeComponent updated = struct.getComponentAt(componentOffset);
+
+                    program.endTransaction(txId, true);
+
+                    Map<String, Object> result = new HashMap<>();
+                    result.put("message", "Successfully updated component datatype in structure: " + structureName);
+                    result.put("structureName", struct.getName());
+
+                    Map<String, Object> componentInfo = new HashMap<>();
+                    componentInfo.put("ordinal", updated.getOrdinal());
+                    componentInfo.put("offset", updated.getOffset());
+                    componentInfo.put("length", updated.getLength());
+                    componentInfo.put("oldLength", oldLength);
+                    componentInfo.put("oldFieldName", oldFieldName);
+                    componentInfo.put("newFieldName", updated.getFieldName());
+                    componentInfo.put("oldDataType", oldDataType.getDisplayName());
+                    componentInfo.put("newDataType", updated.getDataType().getDisplayName());
+                    componentInfo.put("oldComment", oldComment);
+                    componentInfo.put("newComment", updated.getComment());
+                    result.put("component", componentInfo);
+                    result.put("structure", createDetailedStructureInfo(struct));
+                    return createJsonResult(result);
+                } catch (Exception e) {
+                    program.endTransaction(txId, false);
+                    Msg.error(this, "Failed to update structure component datatype", e);
+                    return createErrorResult("Failed to update structure component datatype: " + e.getMessage());
                 }
             } catch (Exception e) {
                 return createErrorResult("Error: " + e.getMessage());

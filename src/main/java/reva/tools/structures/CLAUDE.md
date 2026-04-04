@@ -16,7 +16,7 @@ The `reva.tools.structures` package provides tools for creating, manipulating, a
 
 ## Structure Analysis Tools
 
-### Available Tools (7 total)
+### Available Tools (9 total)
 
 1. **parse-c-structure** - Parse and create or replace structures from C-style definitions (create-or-replace semantics)
 2. **validate-c-structure** - Validate C-style structure definitions without creating them
@@ -25,6 +25,8 @@ The `reva.tools.structures` package provides tools for creating, manipulating, a
 5. **apply-structure** - Apply a structure at a specific memory address
 6. **delete-structure** - Delete a structure (with reference checking and force option)
 7. **parse-c-header** - Parse entire C header files and create all structures
+8. **rename-structure-component** - Rename a single structure/union component in place without rebuilding the datatype
+9. **set-structure-component-type** - Update a single structure component datatype in place without rebuilding the datatype
 
 ### Structure Definition Creation
 
@@ -80,6 +82,94 @@ args.put("cDefinition", """
 - Read the structure with `get-structure-info` first to see current layout
 - Structure name in C definition must match existing structure for replacement
 - Fields are completely replaced (not merged)
+
+
+### In-Place Component Renames
+Use `rename-structure-component` when you need to rename one field without replacing the full structure.
+This is especially useful for binaries with intentionally misaligned members where round-tripping through `parse-c-structure` can degrade layout fidelity.
+
+Selector rules:
+- Specify exactly one of `fieldName`, `ordinal`, or `offset`
+- `offset` accepts decimal or hex strings like `0x2e`
+- `newComment` is optional; if provided, it replaces the component comment in the same transaction
+
+Example request:
+```json
+{
+  "programPath": "/VetteColor",
+  "structureName": "Car",
+  "offset": "0x2e",
+  "newFieldName": "autoShiftEnabled"
+}
+```
+
+Example response shape:
+```json
+{
+  "message": "Successfully updated component in structure: Car",
+  "structureName": "Car",
+  "isUnion": false,
+  "component": {
+    "ordinal": 22,
+    "offset": 45,
+    "length": 2,
+    "oldFieldName": "accelModifierFlag",
+    "newFieldName": "autoShiftEnabled",
+    "dataType": "undefined2",
+    "oldComment": "...",
+    "newComment": "..."
+  },
+  "structure": {
+    "name": "Car",
+    "fields": [ ... ]
+  }
+}
+```
+
+### In-Place Component Type Updates
+Use `set-structure-component-type` when you need to recover the true datatype of one layout-sensitive field without rebuilding the full structure.
+This is the companion to `rename-structure-component` for misaligned members.
+
+Selector rules:
+- Specify exactly one of `fieldName`, `ordinal`, or `offset`
+- `dataType` is required and uses the same datatype-string syntax as the datatype tools
+- `newFieldName` and `newComment` are optional and default to the existing values
+- Replacement is fixed-offset and fixed-size: the new datatype must have the same byte length as the existing component
+- Currently this tool targets `Structure` types, not `Union`
+
+Example request:
+```json
+{
+  "programPath": "/VetteColor",
+  "structureName": "Car",
+  "offset": "0x2e",
+  "dataType": "short",
+  "newFieldName": "autoShiftEnabled"
+}
+```
+
+Example response shape:
+```json
+{
+  "message": "Successfully updated component datatype in structure: Car",
+  "structureName": "Car",
+  "component": {
+    "ordinal": 19,
+    "offset": 45,
+    "length": 2,
+    "oldFieldName": "autoShiftEnabled",
+    "newFieldName": "autoShiftEnabled",
+    "oldDataType": "byte[2]",
+    "newDataType": "short",
+    "oldComment": "...",
+    "newComment": "..."
+  },
+  "structure": {
+    "name": "Car",
+    "fields": [ ... ]
+  }
+}
+```
 
 ### C Header Parsing Strategy
 ```java

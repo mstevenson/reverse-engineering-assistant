@@ -170,6 +170,33 @@ class TestFunctionTools:
         assert response is not None
 
 
+class TestStructureTools:
+    """Test structure-related MCP tools"""
+
+    def test_rename_structure_component_callable(self, mcp_client):
+        """rename-structure-component tool is registered and callable"""
+        response = mcp_client.call_tool("rename-structure-component", {
+            "programPath": "/TestProgram",
+            "structureName": "Car",
+            "offset": "0x2e",
+            "newFieldName": "autoShiftEnabled"
+        })
+
+        assert response is not None
+
+
+    def test_set_structure_component_type_callable(self, mcp_client):
+        """set-structure-component-type tool is registered and callable"""
+        response = mcp_client.call_tool("set-structure-component-type", {
+            "programPath": "/TestProgram",
+            "structureName": "Car",
+            "offset": "0x2e",
+            "dataType": "short"
+        })
+
+        assert response is not None
+
+
 class TestToolRegistration:
     """Test that key tools are registered"""
 
@@ -182,6 +209,8 @@ class TestToolRegistration:
         "set-function-custom-storage",
         "clear-function-custom-storage",
         "batch-set-function-custom-storage",
+        "rename-structure-component",
+        "set-structure-component-type",
         "analyze-program",
         "find-cross-references"
     ])
