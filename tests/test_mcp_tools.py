@@ -140,9 +140,38 @@ class TestFunctionTools:
 
         assert response is not None
 
+    def test_get_function_return_storage_callable(self, mcp_client):
+        """get-function-return-storage tool is registered and callable"""
+        response = mcp_client.call_tool("get-function-return-storage", {
+            "programPath": "/TestProgram",
+            "location": "0x00401000"
+        })
+
+        assert response is not None
+
     def test_clear_function_custom_storage_callable(self, mcp_client):
         """clear-function-custom-storage tool is registered and callable"""
         response = mcp_client.call_tool("clear-function-custom-storage", {
+            "programPath": "/TestProgram",
+            "location": "0x00401000"
+        })
+
+        assert response is not None
+
+    def test_set_function_return_storage_callable(self, mcp_client):
+        """set-function-return-storage tool is registered and callable"""
+        response = mcp_client.call_tool("set-function-return-storage", {
+            "programPath": "/TestProgram",
+            "location": "0x00401000",
+            "dataType": "int",
+            "register": "D0"
+        })
+
+        assert response is not None
+
+    def test_clear_function_return_storage_callable(self, mcp_client):
+        """clear-function-return-storage tool is registered and callable"""
+        response = mcp_client.call_tool("clear-function-return-storage", {
             "programPath": "/TestProgram",
             "location": "0x00401000"
         })
@@ -206,8 +235,11 @@ class TestToolRegistration:
         "get-strings",
         "get-decompilation",
         "get-function-custom-storage",
+        "get-function-return-storage",
         "set-function-custom-storage",
+        "set-function-return-storage",
         "clear-function-custom-storage",
+        "clear-function-return-storage",
         "batch-set-function-custom-storage",
         "rename-structure-component",
         "set-structure-component-type",

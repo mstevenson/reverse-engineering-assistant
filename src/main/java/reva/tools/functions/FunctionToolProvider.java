@@ -49,6 +49,7 @@ import ghidra.program.model.listing.Instruction;
 import ghidra.program.model.listing.Parameter;
 import ghidra.program.model.listing.ParameterImpl;
 import ghidra.program.model.listing.Program;
+import ghidra.program.model.listing.ReturnParameterImpl;
 import ghidra.program.model.listing.Variable;
 import ghidra.program.model.lang.Register;
 import ghidra.program.model.listing.VariableStorage;
@@ -331,9 +332,12 @@ public class FunctionToolProvider extends AbstractToolProvider {
         registerFunctionsTool();
         registerFunctionsBySimilarityTool();
         registerGetFunctionCustomStorageTool();
+        registerGetFunctionReturnStorageTool();
         registerSetFunctionPrototypeTool();
         registerSetFunctionCustomStorageTool();
+        registerSetFunctionReturnStorageTool();
         registerClearFunctionCustomStorageTool();
+        registerClearFunctionReturnStorageTool();
         registerBatchSetFunctionCustomStorageTool();
         registerUndefinedFunctionCandidatesTool();
         registerCreateFunctionTool();
@@ -823,6 +827,7 @@ public class FunctionToolProvider extends AbstractToolProvider {
         // Additional function metadata
         functionInfo.put("signature", function.getSignature().toString());
         functionInfo.put("returnType", function.getReturnType().toString());
+        functionInfo.put("returnStorage", function.getReturn().getVariableStorage().toString());
         functionInfo.put("isExternal", function.isExternal());
         functionInfo.put("isThunk", function.isThunk());
         functionInfo.put("customStorageEnabled", function.hasCustomVariableStorage());
@@ -1226,6 +1231,69 @@ public class FunctionToolProvider extends AbstractToolProvider {
     }
 
     /**
+     * Create explicit parameter list from an existing function, preserving current storage.
+     */
+    private List<Variable> buildPreservedParametersFromFunction(Function function, Program program)
+            throws InvalidInputException {
+        List<Variable> parameters = new ArrayList<>();
+        for (Parameter parameter : function.getParameters()) {
+            parameters.add(new ParameterImpl(
+                parameter.getName(),
+                parameter.getDataType(),
+                parameter.getVariableStorage(),
+                program));
+        }
+        return parameters;
+    }
+
+    /**
+     * Build explicit return storage from request fields.
+     */
+    private VariableStorage buildReturnStorage(Program program, DataType dataType,
+            Object singleRegister, Object multiRegisters) throws Exception {
+        if (dataType.getLength() < 0) {
+            throw new IllegalArgumentException(
+                "Return datatype must have a fixed length or be void: " + dataType.getDisplayName());
+        }
+
+        if (dataType == DataType.VOID || dataType.getLength() == 0) {
+            return VariableStorage.VOID_STORAGE;
+        }
+
+        VariableStorage storage;
+        if (singleRegister != null) {
+            Register register = program.getRegister(singleRegister.toString());
+            if (register == null) {
+                throw new IllegalArgumentException("Unknown register '" + singleRegister + "' for return value");
+            }
+            storage = new VariableStorage(program, register);
+        } else if (multiRegisters instanceof List<?> registerList && !registerList.isEmpty()) {
+            Register[] registers = new Register[registerList.size()];
+            for (int regIndex = 0; regIndex < registerList.size(); regIndex++) {
+                Object registerName = registerList.get(regIndex);
+                Register register = program.getRegister(registerName.toString());
+                if (register == null) {
+                    throw new IllegalArgumentException(
+                        "Unknown register '" + registerName + "' for return value");
+                }
+                registers[regIndex] = register;
+            }
+            storage = new VariableStorage(program, registers);
+        } else {
+            throw new IllegalArgumentException(
+                "Return value must include either 'register' or non-empty 'registers'");
+        }
+
+        if (storage.size() != dataType.getLength()) {
+            throw new IllegalArgumentException(
+                "Storage size mismatch for return value: datatype " +
+                dataType.getDisplayName() + " is " + dataType.getLength() +
+                " bytes but storage " + storage + " is " + storage.size() + " bytes");
+        }
+        return storage;
+    }
+
+    /**
      * Resolve function from location with consistent error handling.
      */
     private Function getFunctionAtLocation(Program program, String location) {
@@ -1279,6 +1347,53 @@ public class FunctionToolProvider extends AbstractToolProvider {
                 return createJsonResult(result);
             } catch (Exception e) {
                 return createErrorResult("Error getting function custom storage: " + e.getMessage());
+            }
+        });
+    }
+
+    /**
+     * Register a tool to get explicit return storage information for a function.
+     */
+    private void registerGetFunctionReturnStorageTool() {
+        Map<String, Object> properties = new HashMap<>();
+        properties.put("programPath", Map.of(
+            "type", "string",
+            "description", "Path in the Ghidra Project to the program"
+        ));
+        properties.put("location", Map.of(
+            "type", "string",
+            "description", "Address or symbol name where the function is located"
+        ));
+
+        List<String> required = List.of("programPath", "location");
+
+        McpSchema.Tool tool = McpSchema.Tool.builder()
+            .name("get-function-return-storage")
+            .title("Get Function Return Storage")
+            .description("Return the current return storage model for a function.")
+            .inputSchema(createSchema(properties, required))
+            .build();
+
+        registerTool(tool, (exchange, request) -> {
+            try {
+                Program program = getProgramFromArgs(request);
+                String location = getString(request, "location");
+                Function function = getFunctionAtLocation(program, location);
+
+                Map<String, Object> returnInfo = new LinkedHashMap<>();
+                returnInfo.put("dataType", function.getReturnType().toString());
+                returnInfo.put("storage", function.getReturn().getVariableStorage().toString());
+
+                Map<String, Object> result = new HashMap<>();
+                result.put("success", true);
+                result.put("programPath", getString(request, "programPath"));
+                result.put("address", AddressUtil.formatAddress(function.getEntryPoint()));
+                result.put("customStorageEnabled", function.hasCustomVariableStorage());
+                result.put("returnValue", returnInfo);
+                result.put("function", createFunctionInfo(function, null));
+                return createJsonResult(result);
+            } catch (Exception e) {
+                return createErrorResult("Error getting function return storage: " + e.getMessage());
             }
         });
     }
@@ -1384,6 +1499,97 @@ public class FunctionToolProvider extends AbstractToolProvider {
     }
 
     /**
+     * Register a tool to set explicit custom register-backed return storage on a function.
+     */
+    private void registerSetFunctionReturnStorageTool() {
+        Map<String, Object> properties = new HashMap<>();
+        properties.put("programPath", Map.of(
+            "type", "string",
+            "description", "Path in the Ghidra Project to the program"
+        ));
+        properties.put("location", Map.of(
+            "type", "string",
+            "description", "Address or symbol name where the function is located"
+        ));
+        properties.put("dataType", Map.of(
+            "type", "string",
+            "description", "Return data type string (e.g., 'int', 'char*', 'Car *')"
+        ));
+        properties.put("register", Map.of(
+            "type", "string",
+            "description", "Single register backing the return value"
+        ));
+        properties.put("registers", Map.of(
+            "type", "array",
+            "description", "Optional register list for multi-register return storage",
+            "items", Map.of("type", "string")
+        ));
+
+        List<String> required = List.of("programPath", "location", "dataType");
+
+        McpSchema.Tool tool = McpSchema.Tool.builder()
+            .name("set-function-return-storage")
+            .title("Set Function Return Storage")
+            .description("Assign explicit register-backed storage to a function's return value.")
+            .inputSchema(createSchema(properties, required))
+            .build();
+
+        registerTool(tool, (exchange, request) -> {
+            try {
+                Program program = getProgramFromArgs(request);
+                String programPath = getString(request, "programPath");
+                String location = getString(request, "location");
+                String dataTypeString = getString(request, "dataType");
+                Function function = getFunctionAtLocation(program, location);
+
+                DataType dataType = DataTypeParserUtil.parseDataTypeObjectFromString(dataTypeString, "");
+                if (dataType == null) {
+                    return createErrorResult("Unable to resolve data type: " + dataTypeString);
+                }
+
+                VariableStorage storage = buildReturnStorage(
+                    program,
+                    dataType,
+                    request.arguments().get("register"),
+                    request.arguments().get("registers"));
+
+                int txId = program.startTransaction("Set Function Return Storage");
+                boolean committed = false;
+                try {
+                    if (!function.hasCustomVariableStorage()) {
+                        function.setCustomVariableStorage(true);
+                    }
+                    function.setReturn(dataType, storage, SourceType.USER_DEFINED);
+                    program.endTransaction(txId, true);
+                    committed = true;
+                } catch (Exception e) {
+                    if (!committed) {
+                        program.endTransaction(txId, false);
+                    }
+                    return createErrorResult("Error setting function return storage: " + e.getMessage());
+                }
+
+                invalidateFunctionCaches(programPath);
+
+                Map<String, Object> returnInfo = new LinkedHashMap<>();
+                returnInfo.put("dataType", function.getReturnType().toString());
+                returnInfo.put("storage", function.getReturn().getVariableStorage().toString());
+
+                Map<String, Object> result = new HashMap<>();
+                result.put("success", true);
+                result.put("programPath", programPath);
+                result.put("address", AddressUtil.formatAddress(function.getEntryPoint()));
+                result.put("customStorageEnabled", function.hasCustomVariableStorage());
+                result.put("returnValue", returnInfo);
+                result.put("function", createFunctionInfo(function, null));
+                return createJsonResult(result);
+            } catch (Exception e) {
+                return createErrorResult("Error setting function return storage: " + e.getMessage());
+            }
+        });
+    }
+
+    /**
      * Register a tool to clear explicit custom parameter storage and restore dynamic storage.
      */
     private void registerClearFunctionCustomStorageTool() {
@@ -1443,6 +1649,87 @@ public class FunctionToolProvider extends AbstractToolProvider {
                 return createJsonResult(result);
             } catch (Exception e) {
                 return createErrorResult("Error clearing function custom storage: " + e.getMessage());
+            }
+        });
+    }
+
+    /**
+     * Register a tool to clear explicit return storage and restore default return storage behavior.
+     */
+    private void registerClearFunctionReturnStorageTool() {
+        Map<String, Object> properties = new HashMap<>();
+        properties.put("programPath", Map.of(
+            "type", "string",
+            "description", "Path in the Ghidra Project to the program"
+        ));
+        properties.put("location", Map.of(
+            "type", "string",
+            "description", "Address or symbol name where the function is located"
+        ));
+
+        List<String> required = List.of("programPath", "location");
+
+        McpSchema.Tool tool = McpSchema.Tool.builder()
+            .name("clear-function-return-storage")
+            .title("Clear Function Return Storage")
+            .description("Disable explicit return storage and restore the default return storage model for a function.")
+            .inputSchema(createSchema(properties, required))
+            .build();
+
+        registerTool(tool, (exchange, request) -> {
+            try {
+                Program program = getProgramFromArgs(request);
+                String programPath = getString(request, "programPath");
+                String location = getString(request, "location");
+                Function function = getFunctionAtLocation(program, location);
+
+                int txId = program.startTransaction("Clear Function Return Storage");
+                boolean committed = false;
+                try {
+                    ReturnParameterImpl dynamicReturn =
+                        new ReturnParameterImpl(function.getReturnType(), program);
+
+                    List<Variable> parameters = function.hasCustomVariableStorage()
+                        ? buildPreservedParametersFromFunction(function, program)
+                        : buildDynamicParametersFromFunction(function, program);
+
+                    Function.FunctionUpdateType updateType = function.hasCustomVariableStorage()
+                        ? Function.FunctionUpdateType.CUSTOM_STORAGE
+                        : Function.FunctionUpdateType.DYNAMIC_STORAGE_ALL_PARAMS;
+
+                    function.updateFunction(
+                        null,
+                        dynamicReturn,
+                        parameters,
+                        updateType,
+                        true,
+                        SourceType.USER_DEFINED);
+
+                    program.endTransaction(txId, true);
+                    committed = true;
+                } catch (Exception e) {
+                    if (!committed) {
+                        program.endTransaction(txId, false);
+                    }
+                    return createErrorResult("Error clearing function return storage: " + e.getMessage());
+                }
+
+                invalidateFunctionCaches(programPath);
+
+                Map<String, Object> returnInfo = new LinkedHashMap<>();
+                returnInfo.put("dataType", function.getReturnType().toString());
+                returnInfo.put("storage", function.getReturn().getVariableStorage().toString());
+
+                Map<String, Object> result = new HashMap<>();
+                result.put("success", true);
+                result.put("programPath", programPath);
+                result.put("address", AddressUtil.formatAddress(function.getEntryPoint()));
+                result.put("customStorageEnabled", function.hasCustomVariableStorage());
+                result.put("returnValue", returnInfo);
+                result.put("function", createFunctionInfo(function, null));
+                return createJsonResult(result);
+            } catch (Exception e) {
+                return createErrorResult("Error clearing function return storage: " + e.getMessage());
             }
         });
     }
