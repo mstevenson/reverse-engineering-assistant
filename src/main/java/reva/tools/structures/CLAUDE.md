@@ -16,7 +16,7 @@ The `reva.tools.structures` package provides tools for creating, manipulating, a
 
 ## Structure Analysis Tools
 
-### Available Tools (9 total)
+### Available Tools (10 total)
 
 1. **parse-c-structure** - Parse and create or replace structures from C-style definitions (create-or-replace semantics)
 2. **validate-c-structure** - Validate C-style structure definitions without creating them
@@ -25,8 +25,27 @@ The `reva.tools.structures` package provides tools for creating, manipulating, a
 5. **apply-structure** - Apply a structure at a specific memory address
 6. **delete-structure** - Delete a structure (with reference checking and force option)
 7. **parse-c-header** - Parse entire C header files and create all structures
-8. **rename-structure-component** - Rename a single structure/union component in place without rebuilding the datatype
-9. **set-structure-component-type** - Update a single structure component datatype in place without rebuilding the datatype
+8. **rename-structure** - Rename an existing structure or union in place without rebuilding the datatype
+9. **rename-structure-component** - Rename a single structure/union component in place without rebuilding the datatype
+10. **set-structure-component-type** - Update a single structure component datatype in place without rebuilding the datatype
+
+### In-Place Structure Rename
+Use `rename-structure` when the recovered name is better but the existing datatype layout should be preserved exactly.
+Unlike `parse-c-structure`, this does not rebuild the datatype and therefore avoids disturbing fragile layouts or field comments.
+
+Behavior:
+- Renames an existing `Structure` or `Union` directly in the program's datatype manager
+- Fails cleanly on invalid names
+- Fails cleanly on name collisions with an existing datatype
+
+Example request:
+```json
+{
+  "programPath": "/VetteColor",
+  "structureName": "CarState_Unknown",
+  "newStructureName": "CarPhysicsState"
+}
+```
 
 ### Structure Definition Creation
 

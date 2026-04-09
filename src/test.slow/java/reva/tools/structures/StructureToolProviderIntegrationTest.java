@@ -313,6 +313,79 @@ public class StructureToolProviderIntegrationTest extends RevaIntegrationTestBas
     }
 
     @Test
+    public void testRenameStructure() throws Exception {
+        withMcpClient(createMcpTransport(), client -> {
+            client.initialize();
+
+            Map<String, Object> createArgs = new HashMap<>();
+            createArgs.put("programPath", programPath);
+            createArgs.put("cDefinition", "struct RenameMe { int value; };");
+
+            CallToolResult createResult = client.callTool(new CallToolRequest("parse-c-structure", createArgs));
+            assertMcpResultNotError(createResult, "Create structure should not error");
+
+            Map<String, Object> renameArgs = new HashMap<>();
+            renameArgs.put("programPath", programPath);
+            renameArgs.put("structureName", "RenameMe");
+            renameArgs.put("newStructureName", "RenamedStruct");
+
+            CallToolResult result = client.callTool(new CallToolRequest("rename-structure", renameArgs));
+            assertMcpResultNotError(result, "Rename structure should not error");
+
+            TextContent content = (TextContent) result.content().get(0);
+            JsonNode json = parseJsonContent(content.text());
+
+            assertEquals("RenameMe", json.get("oldName").asText());
+            assertEquals("RenamedStruct", json.get("newName").asText());
+            assertTrue("rename should report success", json.get("renamed").asBoolean());
+
+            DataTypeManager dtm = program.getDataTypeManager();
+            assertNull("Old structure name should be gone", findDataTypeByName(dtm, "RenameMe"));
+
+            DataType renamed = findDataTypeByName(dtm, "RenamedStruct");
+            assertNotNull("Renamed structure should exist", renamed);
+            assertTrue("Renamed datatype should still be a structure", renamed instanceof Structure);
+        });
+    }
+
+    @Test
+    public void testRenameStructureReportsCollision() throws Exception {
+        withMcpClient(createMcpTransport(), client -> {
+            client.initialize();
+
+            Map<String, Object> createSourceArgs = new HashMap<>();
+            createSourceArgs.put("programPath", programPath);
+            createSourceArgs.put("cDefinition", "struct CollisionSource { int value; };");
+            CallToolResult createSourceResult = client.callTool(
+                new CallToolRequest("parse-c-structure", createSourceArgs));
+            assertMcpResultNotError(createSourceResult, "Source structure creation should succeed");
+
+            Map<String, Object> createTargetArgs = new HashMap<>();
+            createTargetArgs.put("programPath", programPath);
+            createTargetArgs.put("cDefinition", "struct CollisionTarget { int value; };");
+            CallToolResult createTargetResult = client.callTool(
+                new CallToolRequest("parse-c-structure", createTargetArgs));
+            assertMcpResultNotError(createTargetResult, "Target structure creation should succeed");
+
+            Map<String, Object> renameArgs = new HashMap<>();
+            renameArgs.put("programPath", programPath);
+            renameArgs.put("structureName", "CollisionSource");
+            renameArgs.put("newStructureName", "CollisionTarget");
+
+            CallToolResult result = client.callTool(new CallToolRequest("rename-structure", renameArgs));
+            assertTrue("Rename should fail on name collision", result.isError());
+
+            TextContent content = (TextContent) result.content().get(0);
+            assertTrue("Should mention name collision",
+                content.text().contains("name collision"));
+
+            DataTypeManager dtm = program.getDataTypeManager();
+            assertNotNull("Original source structure should remain", findDataTypeByName(dtm, "CollisionSource"));
+            assertNotNull("Original target structure should remain", findDataTypeByName(dtm, "CollisionTarget"));
+        });
+    }
+
+    @Test
     public void testListStructures() throws Exception {
         withMcpClient(createMcpTransport(), client -> {
             client.initialize();

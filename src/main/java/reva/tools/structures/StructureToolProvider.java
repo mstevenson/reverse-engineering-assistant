@@ -29,6 +29,8 @@ import ghidra.program.model.listing.Listing;
 import ghidra.program.model.listing.Program;
 import ghidra.program.model.mem.Memory;
 import ghidra.util.Msg;
+import ghidra.util.InvalidNameException;
+import ghidra.util.exception.DuplicateNameException;
 import io.modelcontextprotocol.server.McpSyncServer;
 import io.modelcontextprotocol.spec.McpSchema;
 import reva.tools.AbstractToolProvider;
@@ -56,6 +58,7 @@ public class StructureToolProvider extends AbstractToolProvider {
         registerGetStructureInfoTool();
         registerListStructuresTool();
         registerApplyStructureTool();
+        registerRenameStructureTool();
         registerRenameStructureComponentTool();
         registerSetStructureComponentTypeTool();
         registerDeleteStructureTool();
@@ -470,6 +473,81 @@ public class StructureToolProvider extends AbstractToolProvider {
                     program.endTransaction(txId, false);
                     Msg.error(this, "Failed to apply structure", e);
                     return createErrorResult("Failed to apply structure: " + e.getMessage());
+                }
+            } catch (Exception e) {
+                return createErrorResult("Error: " + e.getMessage());
+            }
+        });
+    }
+
+    /**
+     * Register tool to rename an existing structure or union in place.
+     */
+    private void registerRenameStructureTool() {
+        Map<String, Object> properties = new HashMap<>();
+        properties.put("programPath", SchemaUtil.createStringProperty("Path of the program"));
+        properties.put("structureName", SchemaUtil.createStringProperty("Existing name of the structure"));
+        properties.put("newStructureName", SchemaUtil.createStringProperty("New name for the structure"));
+
+        List<String> required = new ArrayList<>();
+        required.add("programPath");
+        required.add("structureName");
+        required.add("newStructureName");
+
+        McpSchema.Tool tool = McpSchema.Tool.builder()
+            .name("rename-structure")
+            .title("Rename Structure")
+            .description("Rename an existing structure or union in place without rebuilding it. " +
+                         "Fails if the requested name collides with another datatype or is invalid.")
+            .inputSchema(createSchema(properties, required))
+            .build();
+
+        registerTool(tool, (exchange, request) -> {
+            try {
+                Program program = getProgramFromArgs(request);
+                String structureName = getString(request, "structureName");
+                String newStructureName = getString(request, "newStructureName");
+
+                DataTypeManager dtm = program.getDataTypeManager();
+                DataType dt = findDataTypeByName(dtm, structureName);
+                if (dt == null) {
+                    return createErrorResult("Structure not found: " + structureName);
+                }
+                if (!(dt instanceof Composite composite)) {
+                    return createErrorResult("Data type is not a structure or union: " + structureName);
+                }
+
+                if (structureName.equals(newStructureName)) {
+                    Map<String, Object> result = createDetailedStructureInfo(composite);
+                    result.put("message", "Structure already has requested name: " + structureName);
+                    result.put("oldName", structureName);
+                    result.put("newName", composite.getName());
+                    result.put("renamed", false);
+                    return createJsonResult(result);
+                }
+
+                int txId = program.startTransaction("Rename Structure");
+                try {
+                    String oldName = composite.getName();
+                    composite.setName(newStructureName);
+                    program.endTransaction(txId, true);
+
+                    Map<String, Object> result = createDetailedStructureInfo(composite);
+                    result.put("message", "Successfully renamed structure: " + oldName + " -> " + composite.getName());
+                    result.put("oldName", oldName);
+                    result.put("newName", composite.getName());
+                    result.put("renamed", true);
+                    return createJsonResult(result);
+                } catch (DuplicateNameException e) {
+                    program.endTransaction(txId, false);
+                    return createErrorResult("Failed to rename structure due to name collision: " + e.getMessage());
+                } catch (InvalidNameException e) {
+                    program.endTransaction(txId, false);
+                    return createErrorResult("Failed to rename structure due to invalid name: " + e.getMessage());
+                } catch (Exception e) {
+                    program.endTransaction(txId, false);
+                    Msg.error(this, "Failed to rename structure", e);
+                    return createErrorResult("Failed to rename structure: " + e.getMessage());
                 }
             } catch (Exception e) {
                 return createErrorResult("Error: " + e.getMessage());

@@ -202,6 +202,17 @@ class TestFunctionTools:
 class TestStructureTools:
     """Test structure-related MCP tools"""
 
+    def test_rename_structure_callable(self, mcp_client):
+        """rename-structure tool is registered and callable"""
+        response = mcp_client.call_tool("rename-structure", {
+            "programPath": "/TestProgram",
+            "structureName": "Car",
+            "newStructureName": "Vehicle"
+        })
+
+        assert response is not None
+
+
     def test_rename_structure_component_callable(self, mcp_client):
         """rename-structure-component tool is registered and callable"""
         response = mcp_client.call_tool("rename-structure-component", {
@@ -241,6 +252,7 @@ class TestToolRegistration:
         "clear-function-custom-storage",
         "clear-function-return-storage",
         "batch-set-function-custom-storage",
+        "rename-structure",
         "rename-structure-component",
         "set-structure-component-type",
         "analyze-program",
