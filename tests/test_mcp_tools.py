@@ -237,6 +237,45 @@ class TestStructureTools:
         assert response is not None
 
 
+class TestEnumAndEquateTools:
+    """Test enum and equate MCP tools"""
+
+    def test_create_enum_callable(self, mcp_client):
+        """create-enum tool is registered and callable"""
+        response = mcp_client.call_tool("create-enum", {
+            "programPath": "/TestProgram",
+            "enumName": "CarMode",
+            "members": [
+                {"name": "CITY", "value": 0},
+                {"name": "FREEWAY", "value": 1}
+            ]
+        })
+
+        assert response is not None
+
+    def test_apply_enum_callable(self, mcp_client):
+        """apply-enum tool is registered and callable"""
+        response = mcp_client.call_tool("apply-enum", {
+            "programPath": "/TestProgram",
+            "addressOrSymbol": "0x00400000",
+            "enumName": "CarMode"
+        })
+
+        assert response is not None
+
+    def test_set_equate_callable(self, mcp_client):
+        """set-equate tool is registered and callable"""
+        response = mcp_client.call_tool("set-equate", {
+            "programPath": "/TestProgram",
+            "addressOrSymbol": "0x00401000",
+            "operandIndex": 0,
+            "equateName": "kRoadTypeHighway",
+            "value": 2
+        })
+
+        assert response is not None
+
+
 class TestToolRegistration:
     """Test that key tools are registered"""
 
@@ -265,4 +304,14 @@ class TestToolRegistration:
 
         # Should get some response (even if error due to missing required args)
         # The key is that we get a response, not a connection error
+        assert response is not None
+
+    @pytest.mark.parametrize("tool_name", [
+        "create-enum",
+        "apply-enum",
+        "set-equate",
+    ])
+    def test_new_tool_is_registered(self, mcp_client, tool_name):
+        """New enum/equate tools are registered and callable"""
+        response = mcp_client.call_tool(tool_name, {})
         assert response is not None

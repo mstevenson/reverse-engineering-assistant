@@ -16,6 +16,7 @@
 package reva.tools.datatypes;
 
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -23,8 +24,12 @@ import java.util.Map;
 import ghidra.app.services.DataTypeArchiveService;
 import ghidra.program.model.data.BuiltInDataTypeManager;
 import ghidra.program.model.data.Category;
+import ghidra.program.model.data.CategoryPath;
 import ghidra.program.model.data.DataType;
+import ghidra.program.model.data.DataTypeConflictHandler;
 import ghidra.program.model.data.DataTypeManager;
+import ghidra.program.model.data.Enum;
+import ghidra.program.model.data.EnumDataType;
 import ghidra.program.model.listing.Program;
 import ghidra.util.Msg;
 import io.modelcontextprotocol.server.McpSyncServer;
@@ -52,6 +57,7 @@ public class DataTypeToolProvider extends AbstractToolProvider {
         registerGetDataTypeArchivesTool();
         registerGetDataTypesTool();
         registerGetDataTypeByStringTool();
+        registerCreateEnumTool();
     }
 
     /**
@@ -371,6 +377,165 @@ public class DataTypeToolProvider extends AbstractToolProvider {
     }
 
     /**
+     * Register a tool to create or replace an enum datatype in a program.
+     */
+    private void registerCreateEnumTool() {
+        Map<String, Object> memberProperties = new HashMap<>();
+        memberProperties.put("name", Map.of(
+            "type", "string",
+            "description", "Enum member name"
+        ));
+        memberProperties.put("value", Map.of(
+            "description", "Enum member value (decimal, hex like 0x10, or negative)",
+            "anyOf", List.of(
+                Map.of("type", "integer"),
+                Map.of("type", "string")
+            )
+        ));
+        memberProperties.put("comment", Map.of(
+            "type", "string",
+            "description", "Optional enum member comment"
+        ));
+
+        Map<String, Object> properties = new HashMap<>();
+        properties.put("programPath", Map.of(
+            "type", "string",
+            "description", "Path in the Ghidra Project to the program"
+        ));
+        properties.put("enumName", Map.of(
+            "type", "string",
+            "description", "Name of the enum to create or replace"
+        ));
+        properties.put("length", Map.of(
+            "type", "integer",
+            "description", "Enum storage length in bytes",
+            "default", 4
+        ));
+        properties.put("category", Map.of(
+            "type", "string",
+            "description", "Category path for the enum (default: /Enum)",
+            "default", "/Enum"
+        ));
+        properties.put("description", Map.of(
+            "type", "string",
+            "description", "Optional enum description"
+        ));
+        properties.put("members", Map.of(
+            "type", "array",
+            "description", "Enum members to create or replace",
+            "items", createSchema(memberProperties, List.of("name", "value"))
+        ));
+
+        List<String> required = List.of("programPath", "enumName", "members");
+
+        McpSchema.Tool tool = McpSchema.Tool.builder()
+            .name("create-enum")
+            .title("Create Enum")
+            .description("Create or replace an enum datatype in a program. " +
+                         "If an enum with the same name exists, its members are replaced in place.")
+            .inputSchema(createSchema(properties, required))
+            .build();
+
+        registerTool(tool, (exchange, request) -> {
+            try {
+                Program program = getProgramFromArgs(request);
+                String enumName = getString(request, "enumName");
+                int length = getOptionalInt(request, "length", 4);
+                String category = getOptionalString(request, "category", "/Enum");
+                String description = getOptionalString(request, "description", null);
+
+                if (length <= 0) {
+                    return createErrorResult("Enum length must be positive");
+                }
+
+                Object rawMembers = request.arguments().get("members");
+                if (!(rawMembers instanceof List<?> memberList)) {
+                    return createErrorResult("Parameter 'members' must be an array");
+                }
+                if (memberList.isEmpty()) {
+                    return createErrorResult("Enum must contain at least one member");
+                }
+
+                DataTypeManager dtm = program.getDataTypeManager();
+                DataType existing = findDataTypeByName(dtm, enumName);
+
+                int txId = program.startTransaction("Create Enum");
+                boolean committed = false;
+                try {
+                    EnumDataType enumDt;
+                    boolean replacedExisting = false;
+                    if (existing != null) {
+                        if (!(existing instanceof Enum existingEnum)) {
+                            throw new IllegalArgumentException(
+                                "A non-enum datatype with this name already exists: " + enumName);
+                        }
+                        enumDt = (EnumDataType) existingEnum;
+                        replacedExisting = true;
+
+                        for (String existingName : Arrays.asList(enumDt.getNames())) {
+                            enumDt.remove(existingName);
+                        }
+                        enumDt.setLength(length);
+                    } else {
+                        enumDt = new EnumDataType(new CategoryPath(category), enumName, length);
+                        DataType resolved = dtm.resolve(enumDt, DataTypeConflictHandler.DEFAULT_HANDLER);
+                        if (!(resolved instanceof EnumDataType resolvedEnum)) {
+                            throw new IllegalStateException("Resolved datatype is not an enum: " + resolved.getName());
+                        }
+                        enumDt = resolvedEnum;
+                    }
+
+                    if (description != null) {
+                        enumDt.setDescription(description);
+                    }
+
+                    for (int i = 0; i < memberList.size(); i++) {
+                        Object rawMember = memberList.get(i);
+                        if (!(rawMember instanceof Map<?, ?> rawMap)) {
+                            throw new IllegalArgumentException("Enum member at index " + i + " must be an object");
+                        }
+
+                        @SuppressWarnings("unchecked")
+                        Map<String, Object> member = (Map<String, Object>) rawMap;
+                        String memberName = getString(member, "name");
+                        long value = parseFlexibleLong(member.get("value"), "members[" + i + "].value");
+                        String memberComment = getOptionalString(member, "comment", null);
+
+                        if (memberComment != null) {
+                            enumDt.add(memberName, value, memberComment);
+                        } else {
+                            enumDt.add(memberName, value);
+                        }
+                    }
+
+                    CategoryPath catPath = new CategoryPath(category);
+                    if (!enumDt.getCategoryPath().equals(catPath)) {
+                        Category cat = dtm.createCategory(catPath);
+                        if (cat != null) {
+                            cat.moveDataType(enumDt, DataTypeConflictHandler.REPLACE_HANDLER);
+                        }
+                    }
+
+                    program.endTransaction(txId, true);
+                    committed = true;
+
+                    Map<String, Object> result = createEnumInfo(enumDt);
+                    result.put("message", (replacedExisting ? "Successfully updated enum: " : "Successfully created enum: ")
+                        + enumDt.getName());
+                    return createJsonResult(result);
+                } catch (Exception e) {
+                    if (!committed) {
+                        program.endTransaction(txId, false);
+                    }
+                    return createErrorResult("Error creating enum: " + e.getMessage());
+                }
+            } catch (Exception e) {
+                return createErrorResult("Error creating enum: " + e.getMessage());
+            }
+        });
+    }
+
+    /**
      * Add data types recursively from a category and its subcategories
      * @param category The category to get data types from
      * @param dataTypes The list to add data types to
@@ -394,5 +559,55 @@ public class DataTypeToolProvider extends AbstractToolProvider {
      */
     private Map<String, Object> createDataTypeInfo(DataType dt) {
         return DataTypeParserUtil.createDataTypeInfo(dt);
+    }
+
+    private Map<String, Object> createEnumInfo(Enum enumDt) {
+        Map<String, Object> info = createDataTypeInfo((DataType) enumDt);
+        info.put("memberCount", enumDt.getCount());
+
+        List<Map<String, Object>> members = new ArrayList<>();
+        for (String memberName : enumDt.getNames()) {
+            Map<String, Object> memberInfo = new HashMap<>();
+            memberInfo.put("name", memberName);
+            memberInfo.put("value", enumDt.getValue(memberName));
+            memberInfo.put("comment", enumDt.getComment(memberName));
+            members.add(memberInfo);
+        }
+        info.put("members", members);
+        return info;
+    }
+
+    private DataType findDataTypeByName(DataTypeManager dtm, String name) {
+        DataType direct = dtm.getDataType(name);
+        if (direct != null) {
+            return direct;
+        }
+
+        var iter = dtm.getAllDataTypes();
+        while (iter.hasNext()) {
+            DataType dt = iter.next();
+            if (dt.getName().equals(name)) {
+                return dt;
+            }
+        }
+        return null;
+    }
+
+    private long parseFlexibleLong(Object value, String key)
+        throws IllegalArgumentException {
+        if (value == null) {
+            throw new IllegalArgumentException("Missing required parameter: " + key);
+        }
+        if (value instanceof Number number) {
+            return number.longValue();
+        }
+        if (value instanceof String str) {
+            try {
+                return Long.decode(str);
+            } catch (NumberFormatException e) {
+                throw new IllegalArgumentException("Parameter '" + key + "' must be a number, got: " + value);
+            }
+        }
+        throw new IllegalArgumentException("Parameter '" + key + "' must be a number");
     }
 }

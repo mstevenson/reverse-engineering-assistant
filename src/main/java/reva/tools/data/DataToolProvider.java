@@ -24,12 +24,18 @@ import com.fasterxml.jackson.core.JsonProcessingException;
 
 import ghidra.program.model.address.Address;
 import ghidra.program.model.data.DataType;
+import ghidra.program.model.data.Enum;
+import ghidra.program.model.listing.Instruction;
 import ghidra.program.model.listing.Data;
 import ghidra.program.model.listing.Listing;
 import ghidra.program.model.listing.Program;
 import ghidra.program.model.mem.MemoryAccessException;
+import ghidra.program.model.symbol.Equate;
+import ghidra.program.model.symbol.EquateTable;
 import ghidra.program.model.symbol.Symbol;
 import ghidra.program.model.symbol.SymbolTable;
+import ghidra.util.exception.DuplicateNameException;
+import ghidra.util.exception.InvalidInputException;
 import io.modelcontextprotocol.server.McpSyncServer;
 import io.modelcontextprotocol.spec.McpSchema;
 import io.modelcontextprotocol.spec.McpSchema.CallToolResult;
@@ -56,6 +62,8 @@ public class DataToolProvider extends AbstractToolProvider {
     public void registerTools() {
         registerGetDataTool();
         registerApplyDataTypeTool();
+        registerApplyEnumTool();
+        registerSetEquateTool();
         registerCreateLabelTool();
     }
 
@@ -196,6 +204,171 @@ public class DataToolProvider extends AbstractToolProvider {
                 }
             } catch (Exception e) {
                 return createErrorResult("Error applying data type to symbol: " + e.getMessage());
+            }
+        });
+    }
+
+    /**
+     * Register a tool to apply an enum datatype to an address or symbol.
+     */
+    private void registerApplyEnumTool() {
+        Map<String, Object> properties = new HashMap<>();
+        properties.put("programPath", Map.of(
+            "type", "string",
+            "description", "Path in the Ghidra Project to the program"
+        ));
+        properties.put("addressOrSymbol", Map.of(
+            "type", "string",
+            "description", "Address or symbol name to apply the enum to"
+        ));
+        properties.put("enumName", Map.of(
+            "type", "string",
+            "description", "Name of the enum datatype to apply"
+        ));
+        properties.put("archiveName", Map.of(
+            "type", "string",
+            "description", "Optional data type archive to search first.",
+            "default", ""
+        ));
+        properties.put("clearExisting", Map.of(
+            "type", "boolean",
+            "description", "Clear existing data before applying the enum",
+            "default", true
+        ));
+
+        List<String> required = List.of("programPath", "addressOrSymbol", "enumName");
+
+        McpSchema.Tool tool = McpSchema.Tool.builder()
+            .name("apply-enum")
+            .title("Apply Enum")
+            .description("Apply an enum datatype to a specific address or symbol in a program")
+            .inputSchema(createSchema(properties, required))
+            .build();
+
+        registerTool(tool, (exchange, request) -> {
+            Program program = getProgramFromArgs(request);
+            Address targetAddress = getAddressFromArgs(request, program, "addressOrSymbol");
+            String enumName = getString(request, "enumName");
+            String archiveName = getOptionalString(request, "archiveName", "");
+            boolean clearExisting = getOptionalBoolean(request, "clearExisting", true);
+
+            try {
+                DataType dt = DataTypeParserUtil.parseDataTypeObjectFromString(enumName, archiveName);
+                if (dt == null) {
+                    return createErrorResult("Could not find enum datatype: " + enumName);
+                }
+                if (!(dt instanceof Enum enumDt)) {
+                    return createErrorResult("Data type is not an enum: " + enumName);
+                }
+
+                return applyDataTypeAtAddress(program, targetAddress, enumDt, clearExisting, "apply enum");
+            } catch (Exception e) {
+                return createErrorResult("Error applying enum: " + e.getMessage());
+            }
+        });
+    }
+
+    /**
+     * Register a tool to set an equate reference on an instruction operand.
+     */
+    private void registerSetEquateTool() {
+        Map<String, Object> properties = new HashMap<>();
+        properties.put("programPath", Map.of(
+            "type", "string",
+            "description", "Path in the Ghidra Project to the program"
+        ));
+        properties.put("addressOrSymbol", Map.of(
+            "type", "string",
+            "description", "Instruction address or symbol name where the equate should be applied"
+        ));
+        properties.put("operandIndex", Map.of(
+            "type", "integer",
+            "description", "Instruction operand index to annotate"
+        ));
+        properties.put("equateName", Map.of(
+            "type", "string",
+            "description", "Equate name to create or reuse"
+        ));
+        properties.put("value", Map.of(
+            "description", "Equate value (decimal, hex like 0x10, or negative)",
+            "anyOf", List.of(
+                Map.of("type", "integer"),
+                Map.of("type", "string")
+            )
+        ));
+        properties.put("replaceExisting", Map.of(
+            "type", "boolean",
+            "description", "Remove any existing equates from the operand before applying this one",
+            "default", false
+        ));
+
+        List<String> required = List.of("programPath", "addressOrSymbol", "operandIndex", "equateName", "value");
+
+        McpSchema.Tool tool = McpSchema.Tool.builder()
+            .name("set-equate")
+            .title("Set Equate")
+            .description("Create or reuse an equate and attach it to a specific instruction operand")
+            .inputSchema(createSchema(properties, required))
+            .build();
+
+        registerTool(tool, (exchange, request) -> {
+            try {
+                Program program = getProgramFromArgs(request);
+                Address address = getAddressFromArgs(request, program, "addressOrSymbol");
+                int operandIndex = getInt(request, "operandIndex");
+                String equateName = getString(request, "equateName");
+                long value = parseFlexibleLong(request.arguments().get("value"), "value");
+                boolean replaceExisting = getOptionalBoolean(request, "replaceExisting", false);
+
+                Listing listing = program.getListing();
+                Instruction instruction = listing.getInstructionAt(address);
+                if (instruction == null) {
+                    return createErrorResult("No instruction found at address: " + AddressUtil.formatAddress(address));
+                }
+                if (operandIndex < 0 || operandIndex >= instruction.getNumOperands()) {
+                    return createErrorResult("Operand index out of range: " + operandIndex);
+                }
+
+                EquateTable equateTable = program.getEquateTable();
+
+                int transactionID = program.startTransaction("Set Equate");
+                boolean success = false;
+                try {
+                    if (replaceExisting) {
+                        for (Equate existing : equateTable.getEquates(address, operandIndex)) {
+                            existing.removeReference(address, operandIndex);
+                        }
+                    }
+
+                    Equate equate = equateTable.getEquate(equateName);
+                    if (equate == null) {
+                        equate = equateTable.createEquate(equateName, value);
+                    } else if (equate.getValue() != value) {
+                        throw new IllegalArgumentException(
+                            "Equate name already exists with different value: " + equateName);
+                    }
+
+                    equate.addReference(address, operandIndex);
+                    success = true;
+
+                    Map<String, Object> resultData = new HashMap<>();
+                    resultData.put("success", true);
+                    resultData.put("address", AddressUtil.formatAddress(address));
+                    resultData.put("operandIndex", operandIndex);
+                    resultData.put("equateName", equate.getName());
+                    resultData.put("value", equate.getValue());
+                    resultData.put("displayValue", equate.getDisplayValue());
+                    resultData.put("referenceCount", equate.getReferenceCount());
+                    return createJsonResult(resultData);
+                } catch (DuplicateNameException | InvalidInputException e) {
+                    return createErrorResult("Error setting equate: " + e.getMessage());
+                } catch (Exception e) {
+                    return createErrorResult("Error setting equate: " + e.getMessage());
+                } finally {
+                    program.endTransaction(transactionID, success);
+                }
+            } catch (Exception e) {
+                return createErrorResult("Error setting equate: " + e.getMessage());
             }
         });
     }
@@ -354,5 +527,61 @@ public class DataToolProvider extends AbstractToolProvider {
         } catch (JsonProcessingException e) {
             return createErrorResult("Error converting data to JSON: " + e.getMessage());
         }
+    }
+
+    private CallToolResult applyDataTypeAtAddress(Program program, Address targetAddress, DataType dataType,
+        boolean clearExisting, String operationName) {
+        int transactionID = program.startTransaction("Apply Data Type");
+        boolean success = false;
+
+        try {
+            Listing listing = program.getListing();
+
+            if (clearExisting && listing.getDataAt(targetAddress) != null) {
+                if (dataType.getLength() > 0) {
+                    listing.clearCodeUnits(targetAddress, targetAddress.add(dataType.getLength() - 1), false);
+                } else {
+                    listing.clearCodeUnits(targetAddress, targetAddress, false);
+                }
+            }
+
+            Data createdData = listing.createData(targetAddress, dataType);
+            if (createdData == null) {
+                throw new Exception("Failed to create data at address: " + targetAddress);
+            }
+
+            success = true;
+
+            Map<String, Object> resultData = new HashMap<>();
+            resultData.put("success", true);
+            resultData.put("address", AddressUtil.formatAddress(targetAddress));
+            resultData.put("dataType", dataType.getName());
+            resultData.put("dataTypeDisplayName", dataType.getDisplayName());
+            resultData.put("length", dataType.getLength());
+            resultData.put("operation", operationName);
+
+            return createJsonResult(resultData);
+        } catch (Exception e) {
+            return createErrorResult("Error during " + operationName + ": " + e.getMessage());
+        } finally {
+            program.endTransaction(transactionID, success);
+        }
+    }
+
+    private long parseFlexibleLong(Object value, String key) {
+        if (value == null) {
+            throw new IllegalArgumentException("Missing required parameter: " + key);
+        }
+        if (value instanceof Number number) {
+            return number.longValue();
+        }
+        if (value instanceof String str) {
+            try {
+                return Long.decode(str);
+            } catch (NumberFormatException e) {
+                throw new IllegalArgumentException("Parameter '" + key + "' must be a number, got: " + value);
+            }
+        }
+        throw new IllegalArgumentException("Parameter '" + key + "' must be a number");
     }
 }
